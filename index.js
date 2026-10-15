@@ -14,6 +14,8 @@ import tls from 'node:tls';
 import dns from 'node:dns/promises';
 import { Readable } from 'node:stream';
 import vm from 'node:vm';
+import crypto from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 
 const PORT = Number(process.env.PORT) || 8787;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -25,7 +27,8 @@ const MAX_BUFFERED_BYTES = 16 * 1024 * 1024; // HTML / CSS rewriting buffers the
 const DROP_REQUEST_HEADERS = new Set([
   'host', 'connection', 'keep-alive', 'proxy-connection', 'te', 'trailer', 'transfer-encoding',
   'accept-encoding', 'origin', 'referer', 'cookie', 'cdn-loop', 'x-real-ip', 'x-forwarded-for',
-  'x-forwarded-proto', 'x-forwarded-host', 'true-client-ip', 'upgrade', 'expect',
+  'x-forwarded-proto', 'x-forwarded-host', 'true-client-ip', 'upgrade', 'expect', 'forwarded', 'via',
+  'x-client-ip', 'x-forwarded-port', 'x-forwarded-scheme', 'x-px-dest',
 ]);
 
 const DROP_RESPONSE_HEADERS = [
@@ -75,6 +78,63 @@ function safeLookup(hostname, options, callback) {
 const agentOpts = { keepAlive: true, lookup: safeLookup };
 const agents = { 'http:': new http.Agent(agentOpts), 'https:': new https.Agent(agentOpts) };
 
+// Many servers send an incomplete certificate chain. Browsers fill the gap by
+// downloading the missing intermediates (named in the certificate's AIA
+// extension); Node doesn't, so do the same and keep an agent per host that
+// trusts them.
+const hostAgents = new Map(); // host:port -> Promise<https.Agent | null>
+const CHAIN_ERRORS = new Set(['UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY', 'UNABLE_TO_GET_ISSUER_CERT']);
+const rootCAs = () => (tls.getCACertificates ? tls.getCACertificates('default') : tls.rootCertificates);
+
+function chainAgent(host, port) {
+  const key = `${host}:${port}`;
+  if (!hostAgents.has(key)) {
+    const p = fetchIntermediates(host, port).then((pems) => (pems.length
+      ? new https.Agent({ ...agentOpts, ca: [...rootCAs(), ...pems] })
+      : null)).catch(() => null);
+    hostAgents.set(key, p);
+    if (hostAgents.size > 1000) hostAgents.delete(hostAgents.keys().next().value);
+  }
+  return hostAgents.get(key);
+}
+
+async function fetchIntermediates(host, port) {
+  let cert = await new Promise((resolve, reject) => {
+    const s = tls.connect({ host, port, servername: host, rejectUnauthorized: false, lookup: safeLookup });
+    s.setTimeout(10_000, () => s.destroy(new Error('timeout')));
+    s.once('secureConnect', () => { resolve(s.getPeerX509Certificate()); s.destroy(); });
+    s.once('error', reject);
+  });
+  const pems = [];
+  for (let depth = 0; cert && depth < 4; depth++) {
+    const uri = /CA Issuers - URI:(http:\/\/\S+)/.exec(cert.infoAccess || '');
+    if (!uri) break;
+    const der = await download(uri[1]);
+    try { cert = new crypto.X509Certificate(der); } catch { break; }
+    pems.push(cert.toString());
+    if (cert.issuer === cert.subject) break;
+  }
+  return pems;
+}
+
+function download(url) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(url, { agent: agents['http:'], timeout: 10_000 }, (res) => {
+      const chunks = [];
+      let size = 0;
+      res.on('data', (c) => {
+        size += c.length;
+        if (size > 64 * 1024) req.destroy(new Error('too large'));
+        else chunks.push(c);
+      });
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+      res.on('error', reject);
+    });
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+  });
+}
+
 const ENCODINGS = ['gzip', 'deflate', 'br', ...(zlib.createZstdDecompress ? ['zstd'] : [])];
 const DECODERS = {
   gzip: () => zlib.createGunzip(),
@@ -87,9 +147,26 @@ const DECODERS = {
 // fetch() replacement built on node:http(s). Node's global fetch rewrites
 // sec-fetch-mode to "cors" and adds its own defaults, which makes many sites
 // treat page loads as API calls; this sends the browser's headers as given.
-function nodeFetch(url, init = {}) {
+async function nodeFetch(url, init = {}) {
+  const u = new URL(url);
+  const port = Number(u.port) || 443;
+  let agent = agents[u.protocol];
+  if (u.protocol === 'https:' && hostAgents.has(`${u.hostname}:${port}`)) {
+    agent = (await chainAgent(u.hostname, port)) || agent;
+  }
+  try {
+    return await nodeRequest(u, init, agent);
+  } catch (err) {
+    // A streamed body can't be replayed; the next request to the host will use the fixed agent.
+    if (agent !== agents['https:'] || !CHAIN_ERRORS.has(err.code) || init.body) throw err;
+    const fixed = await chainAgent(u.hostname, port);
+    if (!fixed) throw err;
+    return nodeRequest(u, init, fixed);
+  }
+}
+
+function nodeRequest(u, init, agent) {
   return new Promise((resolve, reject) => {
-    const u = new URL(url);
     const headers = {};
     for (const [k, v] of new Headers(init.headers)) headers[k] = v;
     headers['accept-encoding'] = ENCODINGS.join(', ');
@@ -97,8 +174,11 @@ function nodeFetch(url, init = {}) {
     const req = (u.protocol === 'https:' ? https : http).request(u, {
       method: init.method || 'GET',
       headers,
-      agent: agents[u.protocol],
+      agent,
       signal: init.signal,
+      // Browsers accept large and slightly malformed responses; so should we.
+      insecureHTTPParser: true,
+      maxHeaderSize: 256 * 1024,
     });
     req.on('error', reject);
     req.on('response', (res) => {
@@ -113,12 +193,13 @@ function nodeFetch(url, init = {}) {
         body = res.pipe(DECODERS[enc]());
         res.on('error', (e) => body.destroy(e));
         out.delete('content-encoding');
+        out.delete('content-length');
       }
       if (noBody) res.resume();
-      const status = res.statusCode < 200 ? 502 : res.statusCode;
-      resolve(new Response(noBody ? null : Readable.toWeb(body), {
-        status, statusText: res.statusMessage || '', headers: out,
-      }));
+      // Response only allows 200-599 (some sites use e.g. 999) and a plain reason phrase.
+      const status = res.statusCode < 200 || res.statusCode > 599 ? 502 : res.statusCode;
+      const statusText = (res.statusMessage || '').replace(/[^\t\x20-\x7e\x80-\xff]/g, '');
+      resolve(new Response(noBody ? null : Readable.toWeb(body), { status, statusText, headers: out }));
     });
     if (init.body) Readable.fromWeb(init.body).on('error', (e) => req.destroy(e)).pipe(req);
     else req.end();
@@ -178,14 +259,45 @@ function upstreamHeaders(request, self, target) {
   for (const [k, v] of request.headers) {
     if (!DROP_REQUEST_HEADERS.has(k) && !k.startsWith('cf-')) headers.set(k, v);
   }
-  const cookie = (request.headers.get('cookie') || '')
-    .split(/;\s*/).filter((c) => c && !c.startsWith(ORIGIN_COOKIE + '=')).join('; ');
+  const cookie = siteCookies(request.headers.get('cookie'), cookieSite(target.hostname));
   if (cookie) headers.set('cookie', cookie);
 
-  const refUp = upstreamFromProxied(request.headers.get('referer'), self);
+  const refUp = refererUpstream(request, self);
   if (refUp) headers.set('referer', refUp.href);
   if (request.headers.has('origin')) headers.set('origin', refUp ? refUp.origin : target.origin);
+
+  // Describe the request as the site would see it loaded directly: frames
+  // become top-level documents and sec-fetch-site compares the real sites.
+  if (/^i?frame$/.test(headers.get('sec-fetch-dest') || '')) headers.set('sec-fetch-dest', 'document');
+  if (headers.has('sec-fetch-site')) {
+    let site = headers.get('sec-fetch-site');
+    if (refUp) {
+      site = refUp.origin === target.origin ? 'same-origin'
+        : refUp.protocol === target.protocol && cookieSite(refUp.hostname) === cookieSite(target.hostname) ? 'same-site'
+          : 'cross-site';
+    } else if (headers.get('sec-fetch-mode') === 'navigate') {
+      site = 'none';
+    }
+    headers.set('sec-fetch-site', site);
+  }
   return headers;
+}
+
+// The upstream page a request came from. The outermost frame shows the site's
+// real path on the proxy's origin, so a plain same-origin Referer is mapped
+// back using the origin cookie.
+function refererUpstream(request, self) {
+  const ref = request.headers.get('referer');
+  if (!ref) return null;
+  const up = upstreamFromProxied(ref, self);
+  if (up) return up;
+  try {
+    const r = new URL(ref);
+    const origin = r.origin === self.origin && originFromCookie(request);
+    return origin ? new URL(r.pathname + r.search, origin) : null;
+  } catch {
+    return null;
+  }
 }
 
 const errText = (err) => String((err && err.cause && err.cause.message) || (err && err.message) || err);
@@ -262,16 +374,54 @@ function proxLink(value, base, upstream) {
 }
 
 function proxSrcset(value, base) {
-  return value.split(/,\s+/).map((part) => {
-    const m = part.trim().match(/^(\S+)(\s+.*)?$/);
-    return m ? proxUrl(m[1], base) + (m[2] || '') : part;
-  }).join(', ');
+  return mapSrcset(value, (u) => proxUrl(u, base));
 }
 
-function rewriteCss(css, base) {
+// Applies fn to each URL in a srcset. URLs may contain commas
+// ("w_100,h_100/a.jpg 1x") and candidates needn't be followed by a space
+// ("a.jpg 1x,b.jpg 2x"), so this follows the HTML parsing rules. Self-contained
+// so it can be stringified into the page runtime.
+function mapSrcset(value, fn) {
+  const s = String(value);
+  const out = [];
+  let i = 0;
+  while (i < s.length) {
+    while (i < s.length && /[\s,]/.test(s[i])) i++;
+    if (i >= s.length) break;
+    let j = i;
+    while (j < s.length && !/\s/.test(s[j])) j++;
+    let url = s.slice(i, j);
+    let desc = '';
+    if (/,$/.test(url)) {
+      url = url.replace(/,+$/, '');
+    } else {
+      let k = j;
+      let depth = 0;
+      for (; k < s.length; k++) {
+        if (s[k] === '(') depth++;
+        else if (s[k] === ')') depth--;
+        else if (s[k] === ',' && depth <= 0) break;
+      }
+      desc = s.slice(j, k).trim();
+      j = k + 1;
+    }
+    out.push(fn(url) + (desc ? ' ' + desc : ''));
+    i = j;
+  }
+  return out.join(', ');
+}
+
+// `map` lets the page runtime reuse this with its own URL mapper.
+function rewriteCss(css, base, map = (u) => proxUrl(u, base)) {
   return css
-    .replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (m, q, u) => `url(${q}${proxUrl(u, base)}${q})`)
-    .replace(/@import\s+(['"])([^'"]+)\1/gi, (m, q, u) => `@import ${q}${proxUrl(u, base)}${q}`);
+    .replace(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^"'\s)][^)]*?))\s*\)/gi, (m, dq, sq, bare) => {
+      const q = dq != null ? '"' : sq != null ? "'" : '';
+      return `url(${q}${map(dq ?? sq ?? bare)}${q})`;
+    })
+    .replace(/@import\s+(['"])([^'"]+)\1/gi, (m, q, u) => `@import ${q}${map(u)}${q}`)
+    // image-set() also takes bare strings: image-set("a.png" 1x, "b.png" 2x)
+    .replace(/((?:-webkit-)?image-set\()((?:[^()]|\([^()]*\))*)\)/gi, (m, fn, args) =>
+      fn + args.replace(/(^|,)(\s*)(["'])([^"']+)\3/g, (x, c, sp, q, u) => `${c}${sp}${q}${map(u)}${q}`) + ')');
 }
 
 function rewriteRefresh(value, base) {
@@ -309,10 +459,9 @@ async function proxy(request, self, target) {
 
   const out = new Headers(resp.headers);
   for (const h of DROP_RESPONSE_HEADERS) out.delete(h);
-  // nodeFetch has already decompressed the body, so the original framing no longer applies.
+  // nodeFetch has already decompressed the body (and dropped the length if it did).
   const length = Number(out.get('content-length') || 0);
   out.delete('content-encoding');
-  out.delete('content-length');
 
   const location = out.get('location');
   if (location) out.set('location', proxUrl(location, target));
@@ -321,7 +470,8 @@ async function proxy(request, self, target) {
 
   const cookies = resp.headers.getSetCookie ? resp.headers.getSetCookie() : [];
   out.delete('set-cookie');
-  for (const c of cookies) out.append('set-cookie', rewriteCookie(c));
+  const site = cookieSite(target.hostname);
+  for (const c of cookies) out.append('set-cookie', rewriteCookie(c, site, isSecureOrigin(self)));
 
   const init = { status: resp.status, statusText: resp.statusText, headers: out };
   if (request.method === 'HEAD' || [204, 205, 304].includes(resp.status) || !resp.body) {
@@ -331,58 +481,124 @@ async function proxy(request, self, target) {
   const type = (out.get('content-type') || '').toLowerCase();
   if (length > MAX_BUFFERED_BYTES) return new Response(resp.body, init);
 
-  if (/text\/html|application\/xhtml\+xml/.test(type)) {
-    const html = decodeHtml(new Uint8Array(await resp.arrayBuffer()), type);
-    out.set('content-type', `${type.split(';')[0].trim()}; charset=utf-8`);
+  // What the body is used for decides how it is rewritten: a JSONP script
+  // served as text/html is still a script.
+  // The service worker's re-fetches arrive as "empty"; it passes the real destination along.
+  const dest = request.headers.get('x-px-dest') || request.headers.get('sec-fetch-dest') || '';
+  const asScript = /^(?:script|worker|sharedworker)$/.test(dest) && !/^(?:image|video|audio|font)\/|css|wasm|json/.test(type);
+  const rewritten = (body, mime) => {
+    out.delete('content-length');
+    // Rewritten text is always sent as UTF-8.
+    out.set('content-type', `${mime || type.split(';')[0].trim() || 'text/plain'}; charset=utf-8`);
+    return new Response(body, init);
+  };
+
+  if (!asScript && /text\/html|application\/xhtml\+xml/.test(type)) {
+    const html = decodeText(new Uint8Array(await resp.arrayBuffer()), type, /<meta[^>]+charset=["']?([\w-]+)/i);
     out.set('referrer-policy', 'same-origin');
     out.set('cache-control', 'no-store');
-    return new Response(rewriteHtml(html, target), init);
+    // XHTML is served as HTML: the injected runtime isn't well-formed XML.
+    return rewritten(rewriteHtml(html, target), 'text/html');
   }
-  if (type.includes('text/css')) {
-    return new Response(rewriteCss(await resp.text(), target), init);
+  if (type.includes('text/css') && !asScript) {
+    const css = decodeText(new Uint8Array(await resp.arrayBuffer()), type, /^@charset\s+["']([\w-]+)/i);
+    return rewritten(rewriteCss(css.replace(/^@charset\s+["'][\w-]+["']\s*;?/i, ''), target));
   }
-  const dest = request.headers.get('sec-fetch-dest') || '';
-  if (/javascript|ecmascript/.test(type) || (type.includes('text/plain') && /^(?:script|worker|sharedworker)$/.test(dest))) {
+  if (asScript || /javascript|ecmascript/.test(type)) {
     out.set('x-px-js', '1');
-    return new Response(rewriteJs(await resp.text(), target.href, vmCheck), init);
+    const js = rewriteJs(decodeText(new Uint8Array(await resp.arrayBuffer()), type), target.href, vmCheck);
+    return rewritten(/worker$/.test(dest) ? withWorkerRuntime(js) : js, asScript && !/javascript|ecmascript/.test(type) ? 'text/javascript' : null);
   }
   return new Response(resp.body, init);
 }
 
-// Cookies land on the worker's origin; make them usable inside a cross-site iframe.
-function rewriteCookie(cookie) {
+// Decodes text using the charset from a BOM, the Content-Type header or the
+// document itself (`sniff`), falling back to UTF-8, then windows-1252 if the
+// bytes aren't valid UTF-8 (what browsers usually do for unlabelled pages).
+function decodeText(bytes, contentType, sniff) {
+  if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) return new TextDecoder('utf-8').decode(bytes);
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return new TextDecoder('utf-16le').decode(bytes);
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder('utf-16be').decode(bytes);
+  let charset = (/charset=["']?([\w-]+)/i.exec(contentType) || [])[1];
+  if (!charset && sniff) {
+    const head = new TextDecoder('latin1').decode(bytes.subarray(0, 4096));
+    charset = (sniff.exec(head) || [])[1];
+    // A document can't really declare itself UTF-16 in ASCII; browsers read that as UTF-8.
+    if (/^utf-16/i.test(charset || '')) charset = 'utf-8';
+  }
+  if (charset) {
+    try { return new TextDecoder(charset).decode(bytes); } catch {}
+  }
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return new TextDecoder('windows-1252').decode(bytes);
+  }
+}
+
+// Cookies land on the proxy's origin, which every proxied site shares. Each
+// one is stored under its site's name ("example.com~sid") with Path=/ and
+// only sent back to that site, and made usable inside a cross-site iframe.
+function rewriteCookie(cookie, site, secure) {
   const parts = cookie.split(';').map((p) => p.trim()).filter(Boolean);
-  const kept = [parts[0]];
+  if (!parts.length) return cookie;
+  const eq = parts[0].indexOf('=');
+  const name = eq < 0 ? '' : parts[0].slice(0, eq);
+  const kept = [storedCookieName(name, site) + '=' + parts[0].slice(eq + 1)];
   for (const attr of parts.slice(1)) {
-    const name = attr.split('=')[0].toLowerCase();
-    if (['domain', 'samesite', 'secure', 'partitioned'].includes(name)) continue;
+    const a = attr.split('=')[0].trim().toLowerCase();
+    if (['domain', 'path', 'samesite', 'secure', 'partitioned'].includes(a)) continue;
     kept.push(attr);
   }
-  kept.push('SameSite=None', 'Secure', 'Partitioned');
+  kept.push('Path=/');
+  if (secure) kept.push('SameSite=None', 'Secure', 'Partitioned');
   return kept.join('; ');
+}
+
+// The site comes first, so __Host-/__Secure- name rules (which need https)
+// don't apply to the stored cookie; the attributes they demand are added anyway.
+function storedCookieName(name, site) {
+  return site + '~' + name;
+}
+
+// The Cookie header for one site, with the site names taken off again.
+function siteCookies(header, site) {
+  const out = [];
+  for (const c of (header || '').split(/;\s*/)) {
+    const eq = c.indexOf('=');
+    if (eq < 0) continue;
+    const m = /^([^~]*)~(.*)$/s.exec(c.slice(0, eq));
+    if (!m || m[1] !== site) continue;
+    const name = m[2];
+    out.push(name ? name + c.slice(eq) : c.slice(eq + 1));
+  }
+  return out.join('; ');
+}
+
+// Cookies are shared by a registrable domain (example.com, example.co.uk), approximately.
+function cookieSite(hostname) {
+  if (/^[\d.]+$|:/.test(hostname)) return hostname;
+  const parts = hostname.toLowerCase().replace(/\.$/, '').split('.');
+  const sld = parts[parts.length - 2] || '';
+  const n = parts.length > 2 && parts[parts.length - 1].length === 2 &&
+    /^(?:co|com|net|org|gov|edu|ac|or|ne|go|gob|nic|mil|ltd|plc|sch|nom|info|biz)$/.test(sld) ? 3 : 2;
+  return parts.slice(-n).join('.');
+}
+
+// Secure / SameSite=None cookies need https (or localhost, which browsers treat as secure).
+function isSecureOrigin(self) {
+  return self.protocol === 'https:' || ['localhost', '127.0.0.1', '[::1]'].includes(self.hostname);
 }
 
 // ---------------------------------------------------------------- HTML
 
-// Pages are re-served as UTF-8, so decode them using their declared charset.
-function decodeHtml(bytes, contentType) {
-  let charset = (/charset=["']?([\w-]+)/i.exec(contentType) || [])[1];
-  if (!charset) {
-    const head = new TextDecoder('latin1').decode(bytes.subarray(0, 4096));
-    charset = (/<meta[^>]+charset=["']?([\w-]+)/i.exec(head) || [])[1];
-  }
-  try {
-    return new TextDecoder(charset || 'utf-8').decode(bytes);
-  } catch {
-    return new TextDecoder().decode(bytes);
-  }
-}
-
 const URL_ATTRS = ['src', 'action', 'formaction', 'poster', 'background'];
 
-function rewriteHtml(html, upstream) {
-  const script = runtimeScript(upstream.href, PREFIX, false);
-  const ctx = { base: upstream };
+// `base` differs from `upstream` for <iframe srcdoc>, whose document is
+// about:srcdoc and resolves URLs against its parent's base.
+function rewriteHtml(html, upstream, base = upstream) {
+  const script = runtimeScript(upstream, PREFIX, false);
+  const ctx = { base };
   let injected = false;
 
   const out = transformHtml(html, {
@@ -397,8 +613,12 @@ function rewriteHtml(html, upstream) {
         const v = t.get(a);
         if (v != null) t.set(a, proxUrl(v, ctx.base));
       }
-      const srcset = t.get('srcset');
-      if (srcset != null) t.set('srcset', proxSrcset(srcset, ctx.base));
+      for (const a of ['srcset', 'imagesrcset']) {
+        const v = t.get(a);
+        if (v != null) t.set(a, proxSrcset(v, ctx.base));
+      }
+      const xlink = t.get('xlink:href');
+      if (xlink != null) t.set('xlink:href', name === 'a' ? proxLink(xlink, ctx.base, upstream) : proxUrl(xlink, ctx.base));
       const style = t.get('style');
       if (style != null) t.set('style', rewriteCss(style, ctx.base));
       t.removeAttr('integrity');
@@ -423,6 +643,11 @@ function rewriteHtml(html, upstream) {
         case 'image':
           if (href != null) t.set('href', proxUrl(href, ctx.base));
           break;
+        case 'iframe': {
+          const doc = t.get('srcdoc');
+          if (doc != null) t.set('srcdoc', rewriteHtml(doc, upstream, ctx.base));
+          break;
+        }
         case 'object': {
           const data = t.get('data');
           if (data != null) t.set('data', proxUrl(data, ctx.base));
@@ -663,7 +888,7 @@ class Tag {
   }
 }
 
-const NAMED = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+const NAMED = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
 
 function decodeEntities(s) {
   if (!s.includes('&')) return s;
@@ -972,7 +1197,10 @@ function serviceWorker(PREFIX, rewriteJs) {
     if (url.origin === ME) {
       if (url.pathname === '/__px_sw.js' || (url.pathname === '/' && url.searchParams.has('url'))) return;
       if (url.pathname.startsWith(PREFIX)) {
-        if (isScript(req)) e.respondWith(fetch(req).then((r) => rewriteResponse(r, url.href.slice(ME.length + PREFIX.length))));
+        if (isScript(req)) {
+          const tagged = new Request(req, { mode: 'same-origin', headers: withDest(req) });
+          e.respondWith(fetch(tagged).then((r) => rewriteResponse(r, url.href.slice(ME.length + PREFIX.length))));
+        }
         return;
       }
       e.respondWith(siteOf(e.clientId).then((origin) =>
@@ -984,6 +1212,13 @@ function serviceWorker(PREFIX, rewriteJs) {
 
   function isScript(req) {
     return ['script', 'worker', 'sharedworker', 'serviceworker'].includes(req.destination);
+  }
+  // Re-fetched requests lose their destination, which tells the server to
+  // treat the response as a script (and add the worker runtime).
+  function withDest(req) {
+    const h = new Headers(req.headers);
+    if (req.destination) h.set('x-px-dest', req.destination);
+    return h;
   }
 
   async function siteOf(clientId) {
@@ -997,7 +1232,7 @@ function serviceWorker(PREFIX, rewriteJs) {
   async function forward(req, upstream) {
     const init = {
       method: req.method,
-      headers: req.headers,
+      headers: withDest(req),
       credentials: 'include',
       cache: req.cache === 'only-if-cached' ? 'default' : req.cache,
       redirect: 'follow',
@@ -1083,6 +1318,126 @@ function serviceWorkerResponse() {
   });
 }
 
+// ---------------------------------------------------------------- injected worker script
+
+// Runs first in dedicated and shared workers loaded through the proxy, and in
+// blob: workers made by proxied pages (blobSite is then the page's site).
+// A module worker's static imports are fetched as "worker" too, so each of
+// them gets it as well. data: workers don't get it.
+function workerRuntime(PREFIX, blobSite) {
+  if (self.__px$L) return;
+  const real = self.location;
+  const ME = real.origin;
+  const MEU = new URL(ME);
+  const P = ME + PREFIX;
+  const WSP = (MEU.protocol === 'https:' ? 'wss://' : 'ws://') + MEU.host + PREFIX;
+  let UP;
+  try {
+    // blob:<proxy>/<id> is reported as blob:<site>/<id>; like a real blob URL,
+    // it can't resolve relative URLs.
+    if (blobSite) UP = new URL('blob:' + blobSite + real.pathname.slice(real.pathname.lastIndexOf('/')));
+    else if (real.href.startsWith(P)) UP = new URL(real.href.slice(P.length));
+    else return;
+  } catch (e) { return; }
+
+  function prox(u) {
+    if (u == null) return u;
+    const s = String(u instanceof URL ? u.href : u).trim();
+    if (!s || s.startsWith(PREFIX) || s.startsWith(P) || /^(data|blob|javascript|about):/i.test(s)) return u;
+    let x;
+    try { x = new URL(s, UP.href); } catch (e) { return u; }
+    if (x.origin === ME) x = new URL(x.pathname + x.search + x.hash, UP.origin);
+    if (x.protocol === 'ws:' || x.protocol === 'wss:') return WSP + x.href;
+    return /^https?:$/.test(x.protocol) ? P + x.href : u;
+  }
+  function unprox(s) {
+    if (typeof s !== 'string') return s;
+    if (s.startsWith(P)) return s.slice(P.length);
+    if (s.startsWith(WSP)) return s.slice(WSP.length);
+    return s;
+  }
+  const hidden = (obj, name, value) => {
+    try { Object.defineProperty(obj, name, { value, configurable: true }); } catch (e) {}
+  };
+
+  // WorkerLocation is read-only.
+  const L = {};
+  for (const k of ['href', 'origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash']) {
+    Object.defineProperty(L, k, { get: () => UP[k], enumerable: true });
+  }
+  L.toString = () => UP.href;
+  L[Symbol.toStringTag] = 'WorkerLocation';
+  hidden(self, '__px$L', L);
+  hidden(self, '__px$origin', UP.origin);
+  hidden(self, '__px$u', (u, base) => {
+    if (typeof u !== 'string' && !(u instanceof URL)) return u;
+    try { return prox(new URL(String(u), base || UP.href).href); } catch (e) { return u; }
+  });
+  try { Object.defineProperty(self, 'origin', { get: () => UP.origin, configurable: true }); } catch (e) {}
+
+  const _fetch = self.fetch;
+  const reqUrl = Object.getOwnPropertyDescriptor(Request.prototype, 'url').get;
+  self.fetch = async function (input, init) {
+    if (input instanceof Request) {
+      const r = input;
+      const p = prox(reqUrl.call(r));
+      if (p !== reqUrl.call(r)) {
+        const o = {
+          method: r.method, headers: r.headers, credentials: r.credentials, cache: r.cache,
+          redirect: r.redirect, referrer: r.referrer, referrerPolicy: r.referrerPolicy,
+          keepalive: r.keepalive, signal: r.signal, mode: r.mode,
+        };
+        if (r.body && !(init && 'body' in init)) o.body = await r.arrayBuffer();
+        input = new Request(p, o);
+      }
+    } else {
+      input = prox(input);
+    }
+    return _fetch.call(this, input, init);
+  };
+  if (self.XMLHttpRequest) {
+    const _open = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (method, url, ...rest) { return _open.call(this, method, prox(url), ...rest); };
+  }
+  if (self.importScripts) {
+    const _import = self.importScripts;
+    self.importScripts = function (...urls) { return _import.apply(this, urls.map(prox)); };
+  }
+  for (const name of ['WebSocket', 'EventSource', 'Worker', 'SharedWorker']) {
+    const Orig = self[name];
+    if (!Orig) continue;
+    self[name] = new Proxy(Orig, {
+      construct(target, args, newTarget) {
+        if (name === 'WebSocket' && args.length) {
+          try {
+            const x = new URL(String(args[0] instanceof URL ? args[0].href : args[0]), UP.href);
+            if (/^https?:$/.test(x.protocol)) x.protocol = x.protocol === 'https:' ? 'wss:' : 'ws:';
+            args[0] = x.href;
+          } catch (e) {}
+        }
+        if (args.length) args[0] = prox(args[0]);
+        return Reflect.construct(target, args, newTarget);
+      },
+    });
+  }
+  const GETTERS = [['Response', 'url'], ['Request', 'url'], ['XMLHttpRequest', 'responseURL'],
+    ['WebSocket', 'url'], ['EventSource', 'url'], ['PerformanceEntry', 'name']];
+  for (const [cls, prop] of GETTERS) {
+    const proto = self[cls] && self[cls].prototype;
+    const desc = proto && Object.getOwnPropertyDescriptor(proto, prop);
+    if (!desc || !desc.get) continue;
+    Object.defineProperty(proto, prop, { ...desc, get() { return unprox(desc.get.call(this)); } });
+  }
+}
+
+const WORKER_PRELUDE = `(function(__name){(${workerRuntime})(${JSON.stringify(PREFIX)});})(function(f){return f;});`;
+
+// A leading "use strict" must stay first to keep applying to the script.
+function withWorkerRuntime(js) {
+  const strict = /^\s*(?:(?:\/\/[^\n]*|\/\*[\s\S]*?\*\/)\s*)*(['"])use strict\1/.test(js);
+  return (strict ? '"use strict";' : '') + WORKER_PRELUDE + '\n' + js;
+}
+
 // ---------------------------------------------------------------- injected page script
 
 // Runs inside every proxied HTML page before any site script.
@@ -1094,13 +1449,26 @@ function serviceWorkerResponse() {
 // slips through is caught by the service worker, or resolved by the server
 // from the Referer or __px_origin cookie. Scripts are rewritten (rewriteJs) to
 // read location / top / parent through the stand-ins defined here.
-function runtime(C, rewriteJs) {
-  if (window.__pxRuntime) return;
-  window.__pxRuntime = true;
+function runtime(C, rewriteJs, mapSrcset, rewriteCss, workerRuntime) {
+  // A frame's initial about:blank window is reused when it navigates to a
+  // same-origin page, keeping everything installed here. The new document's
+  // runtime then only switches the existing one over to its site.
+  if (window.__pxRuntime) {
+    if (!document.__px$L) window.__pxRuntime(C);
+    return;
+  }
 
-  const ME = location.origin;
+  // location.origin is "null" in about:blank / srcdoc frames; self.origin is the
+  // document's real (inherited) origin and isn't patched yet at this point.
+  const ME = self.origin && self.origin !== 'null' ? self.origin : location.origin;
+  const MEU = new URL(ME);
   const P = ME + C.prefix;
-  const UP = new URL(C.upstream);
+  const WSP = (MEU.protocol === 'https:' ? 'wss://' : 'ws://') + MEU.host + C.prefix;
+  let UP = new URL(C.upstream);
+  const fnSource = Function.prototype.toString;
+  const baseDesc = Object.getOwnPropertyDescriptor(Node.prototype, 'baseURI');
+  const _getAttr = Element.prototype.getAttribute;
+  const _replaceState = history.replaceState;
 
   let nested = false;
   try { nested = window.parent !== window && !!window.parent.__pxRuntime; } catch (e) {}
@@ -1108,10 +1476,11 @@ function runtime(C, rewriteJs) {
   // Upstream URL of the current document / base.
   function upHere() {
     if (location.href.startsWith(P)) return location.href.slice(P.length);
+    if (location.protocol === 'about:') return location.href;
     return UP.origin + location.pathname + location.search + location.hash;
   }
   function upBase() {
-    const b = document.baseURI;
+    const b = baseDesc.get.call(document);
     if (b.startsWith(P)) return b.slice(P.length);
     try {
       const x = new URL(b);
@@ -1131,28 +1500,125 @@ function runtime(C, rewriteJs) {
     if (x.origin === ME) x = new URL(x.pathname + x.search + x.hash, UP.origin);
     if (!/^(https?|wss?):$/.test(x.protocol)) return u;
     if (x.protocol === 'ws:' || x.protocol === 'wss:') {
-      return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + C.prefix + x.href;
+      return WSP + x.href;
     }
     return P + x.href;
   }
 
   function proxSrcset(v) {
-    return String(v).split(/,\s+/).map((part) => {
-      const m = part.trim().match(/^(\S+)(\s+.*)?$/);
-      return m ? prox(m[1]) + (m[2] || '') : part;
-    }).join(', ');
+    return mapSrcset(v, prox);
+  }
+  function unproxSrcset(v) {
+    return mapSrcset(v, unproxAttr);
   }
 
-  // Outermost proxied frame: show the real path and remember the site.
-  if (!nested) {
-    if (location.href.startsWith(P)) {
-      const real = new URL(upHere());
-      if (real.origin === UP.origin) history.replaceState(history.state, '', real.pathname + real.search + real.hash);
+  // Secure / SameSite=None cookies need https (or localhost, which browsers treat as secure).
+  const secureCtx = MEU.protocol === 'https:' || ['localhost', '127.0.0.1', '[::1]'].includes(MEU.hostname);
+  const cookieAttrs = '; path=/' + (secureCtx ? '; SameSite=None; Secure; Partitioned' : '');
+
+
+  // Storage. Cookies, localStorage, sessionStorage and IndexedDB all belong to
+  // the proxy's origin, which every proxied site shares, so each site gets its
+  // own namespace. Cookies match the server's naming ("example.com~sid").
+  let CS = C.cookieSite + '~';
+  const cookieDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie');
+  if (cookieDesc && cookieDesc.get && cookieDesc.set) {
+    Object.defineProperty(Document.prototype, 'cookie', {
+      ...cookieDesc,
+      get() {
+        return cookieDesc.get.call(this).split(/;\s*/).filter((c) => c.startsWith(CS))
+          .map((c) => c.slice(CS.length).replace(/^=/, '')).join('; ');
+      },
+      set(v) {
+        const parts = String(v).split(';').map((x) => x.trim()).filter(Boolean);
+        if (!parts.length) return;
+        const kept = [CS + (parts[0].includes('=') ? parts[0] : '=' + parts[0])];
+        for (const attr of parts.slice(1)) {
+          const a = attr.split('=')[0].trim().toLowerCase();
+          if (!['domain', 'path', 'samesite', 'secure', 'partitioned'].includes(a)) kept.push(attr);
+        }
+        cookieDesc.set.call(this, kept.join('; ') + cookieAttrs);
+      },
+    });
+  }
+  // The async Cookie Store API can't be namespaced the same way; sites fall back to document.cookie.
+  try { delete window.cookieStore; } catch (e) {}
+  try { if ('cookieStore' in window) Object.defineProperty(window, 'cookieStore', { value: undefined, configurable: true }); } catch (e) {}
+
+  let SP = UP.origin + '~';
+  for (const name of ['localStorage', 'sessionStorage']) {
+    let st;
+    try { st = window[name]; } catch (e) { continue; }
+    if (!st) continue;
+    const keys = () => {
+      const out = [];
+      for (let i = 0; i < st.length; i++) {
+        const k = st.key(i);
+        if (k != null && k.startsWith(SP)) out.push(k.slice(SP.length));
+      }
+      return out;
+    };
+    const api = {
+      getItem: (k) => st.getItem(SP + k),
+      setItem: (k, v) => st.setItem(SP + k, v),
+      removeItem: (k) => st.removeItem(SP + k),
+      clear: () => keys().forEach((k) => st.removeItem(SP + k)),
+      key: (i) => { const k = keys()[i]; return k === undefined ? null : k; },
+    };
+    const facade = new Proxy(st, {
+      get(t, p) {
+        if (p === 'length') return keys().length;
+        if (typeof p === 'string' && Object.prototype.hasOwnProperty.call(api, p)) return api[p];
+        if (typeof p === 'symbol' || p in Storage.prototype) {
+          const v = Reflect.get(t, p);
+          return typeof v === 'function' ? v.bind(t) : v;
+        }
+        const v = st.getItem(SP + p);
+        return v === null ? undefined : v;
+      },
+      set(t, p, v) {
+        if (typeof p !== 'string') return false;
+        st.setItem(SP + p, v);
+        return true;
+      },
+      has(t, p) {
+        return typeof p === 'string' && (p in Storage.prototype || st.getItem(SP + p) !== null);
+      },
+      deleteProperty(t, p) {
+        if (typeof p === 'string') st.removeItem(SP + p);
+        return true;
+      },
+      defineProperty(t, p, d) {
+        if (typeof p === 'string' && 'value' in d) st.setItem(SP + p, d.value);
+        return true;
+      },
+      ownKeys: () => keys(),
+      getOwnPropertyDescriptor(t, p) {
+        const v = typeof p === 'string' ? st.getItem(SP + p) : null;
+        return v === null ? undefined : { value: v, writable: true, enumerable: true, configurable: true };
+      },
+    });
+    try { Object.defineProperty(window, name, { get: () => facade, configurable: true, enumerable: true }); } catch (e) {}
+  }
+  const unSP = (k) => (typeof k === 'string' && k.startsWith(SP) ? k.slice(SP.length) : k);
+  const skDesc = window.StorageEvent && Object.getOwnPropertyDescriptor(StorageEvent.prototype, 'key');
+  if (skDesc && skDesc.get) {
+    Object.defineProperty(StorageEvent.prototype, 'key', { ...skDesc, get() { return unSP(skDesc.get.call(this)); } });
+  }
+  if (window.IDBFactory) {
+    const f = IDBFactory.prototype;
+    const { open: idbOpen, deleteDatabase: idbDelete, databases: idbList } = f;
+    f.open = function (n, ...rest) { return idbOpen.call(this, SP + n, ...rest); };
+    f.deleteDatabase = function (n, ...rest) { return idbDelete.call(this, SP + n, ...rest); };
+    if (idbList) {
+      f.databases = function () {
+        return idbList.call(this).then((l) => l.filter((d) => d.name.startsWith(SP)).map((d) => ({ ...d, name: unSP(d.name) })));
+      };
     }
-    try {
-      document.cookie = '__px_origin=' + encodeURIComponent(UP.origin) +
-        '; path=/; SameSite=None; Secure; Partitioned';
-    } catch (e) {}
+    const nameDesc = Object.getOwnPropertyDescriptor(IDBDatabase.prototype, 'name');
+    if (nameDesc && nameDesc.get) {
+      Object.defineProperty(IDBDatabase.prototype, 'name', { ...nameDesc, get() { return unSP(nameDesc.get.call(this)); } });
+    }
   }
 
   // Network APIs
@@ -1160,6 +1626,7 @@ function runtime(C, rewriteJs) {
   // over (e.g. plain Node on http://), so read them into a buffer first.
   const isStream = (b) => typeof ReadableStream !== 'undefined' && b instanceof ReadableStream;
   const _fetch = window.fetch;
+  const reqUrl = Object.getOwnPropertyDescriptor(Request.prototype, 'url').get;
   window.fetch = async function (input, init) {
     if (init && isStream(init.body)) {
       init = { ...init, body: await new Response(init.body).arrayBuffer() };
@@ -1167,9 +1634,10 @@ function runtime(C, rewriteJs) {
     }
     if (input instanceof Request) {
       const r = input;
-      const p = prox(r.url);
+      const u = reqUrl.call(r);
+      const p = prox(u);
       const hasBody = !!r.body && !(init && 'body' in init);
-      if (p !== r.url || hasBody) {
+      if (p !== u || hasBody) {
         const o = {
           method: r.method, headers: r.headers, credentials: r.credentials, cache: r.cache,
           redirect: r.redirect, referrer: r.referrer, referrerPolicy: r.referrerPolicy,
@@ -1190,11 +1658,57 @@ function runtime(C, rewriteJs) {
     return _open.call(this, method, prox(url), ...rest);
   };
 
+  // blob: workers never reach the server or service worker, so remember each
+  // blob's Blob and start such workers from a wrapper that runs the worker
+  // runtime first. Classic workers then importScripts the original (keeping
+  // its "use strict"); module workers import it after the runtime. Wrappers
+  // are reused per URL so SharedWorkers stay shared, and are never revoked
+  // because the worker may not have loaded them yet.
+  const blobs = new Map();
+  const wrappers = new Map();
+  const _createURL = URL.createObjectURL;
+  const _revokeURL = URL.revokeObjectURL;
+  URL.createObjectURL = function (obj) {
+    const url = _createURL.call(this, obj);
+    if (obj instanceof Blob) blobs.set(url, obj);
+    return url;
+  };
+  URL.revokeObjectURL = function (url) {
+    blobs.delete(String(url));
+    return _revokeURL.call(this, url);
+  };
+  function blobWorker(u, opts) {
+    const s = String(u instanceof URL ? u.href : u);
+    const blob = blobs.get(s);
+    if (!blob) return u;
+    const module = !!opts && typeof opts === 'object' && opts.type === 'module';
+    const key = (module ? 'm ' : 'c ') + s;
+    if (!wrappers.has(key)) {
+      const pre = '(function(__name){(' + fnSource.call(workerRuntime) + ')(' + JSON.stringify(C.prefix) + ','
+        + JSON.stringify(UP.origin) + ');})(function(f){return f;});\n';
+      const js = (parts) => _createURL(new Blob(parts, { type: 'text/javascript' }));
+      const orig = JSON.stringify(_createURL(blob));
+      wrappers.set(key, module
+        ? js(['import ' + JSON.stringify(js([pre])) + ';import ' + orig + ';'])
+        : js([pre + 'importScripts(' + orig + ');']));
+    }
+    return wrappers.get(key);
+  }
+
   for (const name of ['WebSocket', 'EventSource', 'Worker', 'SharedWorker']) {
     const Orig = window[name];
     if (!Orig) continue;
     window[name] = new Proxy(Orig, {
       construct(target, args, newTarget) {
+        // WebSocket also takes http(s) and relative URLs, meaning ws(s) on the site.
+        if (name === 'WebSocket' && args.length) {
+          try {
+            const x = new URL(String(args[0] instanceof URL ? args[0].href : args[0]), upBase());
+            if (/^https?:$/.test(x.protocol)) x.protocol = x.protocol === 'https:' ? 'wss:' : 'ws:';
+            args[0] = x.href;
+          } catch (e) {}
+        }
+        if (args.length && /Worker$/.test(name)) args[0] = blobWorker(args[0], args[1]);
         if (args.length) args[0] = prox(args[0]);
         return Reflect.construct(target, args, newTarget);
       },
@@ -1207,8 +1721,9 @@ function runtime(C, rewriteJs) {
   }
 
   const _wopen = window.open;
-  window.open = function (url, ...rest) {
-    return _wopen.call(this, url == null || url === '' ? url : prox(url), ...rest);
+  window.open = function (url, name, ...rest) {
+    const t = frameTarget(name);
+    return _wopen.call(this, url == null || url === '' ? url : prox(url), t == null ? name : t, ...rest);
   };
 
   // Our service worker catches whatever these patches miss. The site's own
@@ -1275,7 +1790,14 @@ function runtime(C, rewriteJs) {
       enumerable: true,
     });
   }
-  Object.defineProperty(L, 'ancestorOrigins', { get: () => real.ancestorOrigins });
+  // Only the proxied frames count as ancestors, under their sites' origins.
+  Object.defineProperty(L, 'ancestorOrigins', {
+    get() {
+      const l = [];
+      try { for (let w = window; w !== pxTop;) { w = w.parent; l.push(w.__px$origin); } } catch (e) {}
+      return Object.freeze(Object.assign(l, { item: (i) => (l[i] === undefined ? null : l[i]), contains: (o) => l.includes(o) }));
+    },
+  });
   L.assign = (u) => go(u);
   L.replace = (u) => go(u, true);
   L.reload = () => real.reload();
@@ -1284,6 +1806,39 @@ function runtime(C, rewriteJs) {
 
   let pxTop = window;
   try { while (pxTop.parent !== pxTop && pxTop.parent.__pxRuntime) pxTop = pxTop.parent; } catch (e) {}
+
+  // _top and _parent would leave the proxy for the page embedding it; aim
+  // them at the outermost proxied frame instead. Returns null if unchanged.
+  function frameTarget(t) {
+    const n = String(t || '').toLowerCase();
+    if (n === '_top' && pxTop !== window) {
+      try {
+        if (!pxTop.name) pxTop.name = '__px_top';
+        return pxTop.name;
+      } catch (e) { return '_self'; }
+    }
+    if (n === '_top' || (n === '_parent' && !nested)) return '_self';
+    return null;
+  }
+  const baseTarget = () => { const b = document.querySelector('base[target]'); return b ? b.getAttribute('target') : ''; };
+  addEventListener('submit', (e) => {
+    const f = e.target;
+    if (!(f instanceof HTMLFormElement)) return;
+    const s = e.submitter;
+    if (s && s.hasAttribute('formtarget')) {
+      const t = frameTarget(s.getAttribute('formtarget'));
+      if (t != null) _setAttr.call(s, 'formtarget', t);
+      return;
+    }
+    const t = frameTarget(f.getAttribute('target') || baseTarget());
+    if (t != null) _setAttr.call(f, 'target', t);
+  }, true);
+  const _submit = HTMLFormElement.prototype.submit; // doesn't fire 'submit'
+  HTMLFormElement.prototype.submit = function () {
+    const t = frameTarget(this.getAttribute('target') || baseTarget());
+    if (t != null) _setAttr.call(this, 'target', t);
+    return _submit.call(this);
+  };
   const _F = Function;
   const jsCheck = (c) => { try { new _F(c); return true; } catch (e) { return false; } };
   const js = (s) => (typeof s === 'string' ? rewriteJs(s, upBase(), jsCheck) : s);
@@ -1291,10 +1846,17 @@ function runtime(C, rewriteJs) {
     try { Object.defineProperty(obj, name, { value, configurable: true }); } catch (e) {}
   };
   hidden(window, '__px$L', L);
-  hidden(document, '__px$L', L);
   hidden(window, '__px$top', pxTop);
   hidden(window, '__px$parent', nested ? window.parent : window);
   hidden(window, '__px$origin', UP.origin);
+  hidden(window, '__pxRuntime', (c) => {
+    C = c;
+    UP = new URL(C.upstream);
+    CS = C.cookieSite + '~';
+    SP = UP.origin + '~';
+    hidden(window, '__px$origin', UP.origin);
+    perDoc();
+  });
   hidden(window, '__px$js', js);
   hidden(window, '__px$u', (u, base) => {
     if (typeof u !== 'string' && !(u instanceof URL)) return u;
@@ -1322,17 +1884,21 @@ function runtime(C, rewriteJs) {
 
   // What the document says about its own address.
   function unprox(s) {
+    if (typeof s !== 'string') return s;
     if (s.startsWith(P)) return s.slice(P.length);
+    if (s.startsWith(WSP)) return s.slice(WSP.length);
     if (s === ME || s.startsWith(ME + '/')) return UP.origin + s.slice(ME.length);
     return s;
   }
-  const ref = document.referrer;
+  // Attribute values: only undo what the proxy wrote.
+  function unproxAttr(s) {
+    if (typeof s !== 'string' || !s.includes(C.prefix)) return s;
+    if (s.startsWith(C.prefix)) return s.slice(C.prefix.length);
+    return s.startsWith(P) || s.startsWith(WSP) ? unprox(s) : s;
+  }
   const own = (obj, name, get) => {
     try { Object.defineProperty(obj, name, { get, configurable: true }); } catch (e) {}
   };
-  own(document, 'URL', upHere);
-  own(document, 'documentURI', upHere);
-  own(document, 'referrer', () => (ref.startsWith(ME + '/') ? unprox(ref) : ''));
   own(window, 'origin', () => UP.origin);
   for (const cls of ['HTMLAnchorElement', 'HTMLAreaElement']) {
     const proto = window[cls].prototype;
@@ -1371,9 +1937,6 @@ function runtime(C, rewriteJs) {
     });
   }
 
-  try {
-    Object.defineProperty(document, 'domain', { get: () => UP.hostname, set: () => {}, configurable: true });
-  } catch (e) {}
 
   // DOM URL attributes. Links (<a>, <area>) are left alone so routers can read
   // real paths; the click handler below routes them through the proxy.
@@ -1383,10 +1946,18 @@ function runtime(C, rewriteJs) {
   Element.prototype.setAttribute = function (name, value) {
     const n = String(name).toLowerCase();
     if (URL_ATTRS.has(n) && !isLink(this)) value = prox(value);
-    else if (n === 'srcset') value = proxSrcset(value);
+    else if (n === 'srcset' || n === 'imagesrcset') value = proxSrcset(value);
     else if (n === 'integrity') return;
+    else if (n === 'srcdoc' && this instanceof HTMLIFrameElement) value = withRuntime(value);
+    else if (n === 'style') value = proxCss(value);
     else if (n.startsWith('on')) value = js(String(value));
     return _setAttr.call(this, name, value);
+  };
+  const _setAttrNS = Element.prototype.setAttributeNS;
+  Element.prototype.setAttributeNS = function (ns, name, value) {
+    const n = String(name).toLowerCase().replace(/^.*:/, '');
+    if (URL_ATTRS.has(n) && !isLink(this)) value = prox(value);
+    return _setAttrNS.call(this, ns, name, value);
   };
 
   const PROPS = [
@@ -1394,52 +1965,167 @@ function runtime(C, rewriteJs) {
     ['HTMLSourceElement', 'src'], ['HTMLSourceElement', 'srcset', proxSrcset], ['HTMLMediaElement', 'src'],
     ['HTMLIFrameElement', 'src'], ['HTMLEmbedElement', 'src'], ['HTMLTrackElement', 'src'],
     ['HTMLLinkElement', 'href'], ['HTMLFormElement', 'action'], ['HTMLVideoElement', 'poster'],
-    ['HTMLObjectElement', 'data'],
+    ['HTMLObjectElement', 'data'], ['HTMLLinkElement', 'imageSrcset', proxSrcset],
   ];
   for (const [cls, prop, fn = prox] of PROPS) {
     const proto = window[cls] && window[cls].prototype;
     const desc = proto && Object.getOwnPropertyDescriptor(proto, prop);
     if (!desc || !desc.set) continue;
-    Object.defineProperty(proto, prop, { ...desc, set(v) { desc.set.call(this, fn(v)); } });
+    const un = fn === prox ? unprox : unproxSrcset;
+    Object.defineProperty(proto, prop, {
+      ...desc,
+      get() { return un(desc.get.call(this)); },
+      set(v) { desc.set.call(this, fn(v)); },
+    });
+  }
+  // Read-only URLs the page can see.
+  const GETTERS = [
+    ['HTMLImageElement', 'currentSrc'], ['HTMLMediaElement', 'currentSrc'], ['Node', 'baseURI'],
+    ['Response', 'url'], ['Request', 'url'], ['XMLHttpRequest', 'responseURL'], ['WebSocket', 'url'],
+    ['EventSource', 'url'], ['PerformanceEntry', 'name'], ['StyleSheet', 'href'],
+  ];
+  for (const [cls, prop] of GETTERS) {
+    const proto = window[cls] && window[cls].prototype;
+    const desc = proto && Object.getOwnPropertyDescriptor(proto, prop);
+    if (!desc || !desc.get) continue;
+    Object.defineProperty(proto, prop, { ...desc, get() { return unprox(desc.get.call(this)); } });
+  }
+  Element.prototype.getAttribute = function (name) {
+    const v = _getAttr.call(this, name);
+    if (v == null || !v.includes(C.prefix)) return v;
+    const n = String(name).toLowerCase();
+    if (URL_ATTRS.has(n)) return unproxAttr(v);
+    if (n === 'srcset' || n === 'imagesrcset') return mapSrcset(v, unproxAttr);
+    return v;
+  };
+
+  // Frames the page creates start as about:blank (or srcdoc) documents on our
+  // origin with none of the patches above, and sites borrow clean fetch, XHR
+  // or location from them. They get this runtime too, set to this page's site.
+  const runtimeCode = () => '(function(__name){(' + fnSource.call(runtime) + ')('
+    + JSON.stringify({ ...C, upstream: location.protocol === 'about:' ? C.upstream : upHere(), swReload: false }).replace(/</g, '\\u003c') + ','
+    + fnSource.call(rewriteJs) + ',' + fnSource.call(mapSrcset) + ',' + fnSource.call(rewriteCss) + ','
+    + fnSource.call(workerRuntime) + ');})(function(f){return f;});';
+  const RT_TAG = /^(\s*<!doctype[^>]*>)?\s*<script data-px-rt>[\s\S]*?<\/script>/i;
+  const withRuntime = (html) => String(html).replace(RT_TAG, '$1').replace(/^(\s*<!doctype[^>]*>)?/i,
+    (m) => m + '<script data-px-rt>' + runtimeCode().replace(/<\/(script)/gi, '<\\/$1') + '<\/script>');
+  function adopt(frame, w) {
+    try {
+      if (!w || w.__pxRuntime || frame.hasAttribute('srcdoc')) return;
+      // A pending src navigation brings its own runtime (and may reuse this window).
+      const src = (_getAttr.call(frame, 'src') || '').trim();
+      if (src && !/^about:blank$/i.test(src)) return;
+      if (w.location.protocol !== 'about:') return;
+      w.eval(runtimeCode());
+    } catch (e) {}
+  }
+  for (const prop of ['contentWindow', 'contentDocument']) {
+    const desc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, prop);
+    if (!desc || !desc.get) continue;
+    const cw = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow').get;
+    Object.defineProperty(HTMLIFrameElement.prototype, prop, {
+      ...desc,
+      get() { adopt(this, cw.call(this)); return desc.get.call(this); },
+    });
+  }
+  const srcdocDesc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'srcdoc');
+  if (srcdocDesc && srcdocDesc.set) {
+    Object.defineProperty(HTMLIFrameElement.prototype, 'srcdoc', {
+      ...srcdocDesc,
+      get() { return srcdocDesc.get.call(this).replace(RT_TAG, '$1'); },
+      set(v) { srcdocDesc.set.call(this, withRuntime(v)); },
+    });
+  }
+
+  // CSS added at runtime: <style> text, style attributes and the CSSOM. Rules
+  // in an external sheet resolve against that sheet's (upstream) URL.
+  function proxCss(css, base) {
+    const s = String(css);
+    if (!/url\(|@import|image-set\(/i.test(s)) return s;
+    return rewriteCss(s, null, (u) => {
+      if (!base || /^\s*#/.test(u)) return prox(u);
+      try { return prox(new URL(u.trim(), base).href); } catch (e) { return u; }
+    });
+  }
+  const sheetBase = (sheet) => (sheet && sheet.href ? unprox(sheet.href) : null);
+  function fixStyle(el) {
+    const v = el.textContent;
+    const nv = proxCss(v);
+    if (nv !== v) el.textContent = nv;
+  }
+  if (window.CSSStyleSheet) {
+    const CSP = CSSStyleSheet.prototype;
+    for (const m of ['insertRule', 'replace', 'replaceSync']) {
+      const orig = CSP[m];
+      if (orig) CSP[m] = function (css, ...rest) { return orig.call(this, proxCss(css, sheetBase(this)), ...rest); };
+    }
+  }
+  if (window.CSSStyleDeclaration) {
+    const SDP = CSSStyleDeclaration.prototype;
+    const setProp = SDP.setProperty;
+    SDP.setProperty = function (name, value, ...rest) {
+      return setProp.call(this, name, value == null ? value : proxCss(value, sheetBase(this.parentRule && this.parentRule.parentStyleSheet)), ...rest);
+    };
+    const cssTextDesc = Object.getOwnPropertyDescriptor(SDP, 'cssText');
+    if (cssTextDesc && cssTextDesc.set) {
+      Object.defineProperty(SDP, 'cssText', { ...cssTextDesc, set(v) { cssTextDesc.set.call(this, proxCss(v)); } });
+    }
   }
 
   // Elements inserted via innerHTML bypass the setters above.
-  const ATTRS = { src: prox, srcset: proxSrcset, poster: prox, action: prox, data: prox };
+  const ATTRS = { src: prox, srcset: proxSrcset, imagesrcset: proxSrcset, poster: prox, action: prox, data: prox };
   function fixTree(root) {
+    if (root.nodeType === 3 && root.parentNode instanceof HTMLStyleElement) return fixStyle(root.parentNode);
     if (root.nodeType !== 1) return;
-    const els = [root, ...root.querySelectorAll('[src],[srcset],[poster],[action],link[href],object[data]')];
+    if (root instanceof HTMLStyleElement) fixStyle(root);
+    else for (const st of root.getElementsByTagName('style')) fixStyle(st);
+    if (root.hasAttribute('style')) fixStyleAttr(root);
+    for (const el of root.querySelectorAll('[style]')) fixStyleAttr(el);
+    const els = [root, ...root.querySelectorAll('[src],[srcset],[imagesrcset],[poster],[action],link[href],object[data],iframe')];
     for (const el of els) {
+      if (el instanceof HTMLIFrameElement) adopt(el, el.contentWindow);
       for (const a in ATTRS) {
-        const v = el.getAttribute(a);
+        const v = _getAttr.call(el, a);
         if (v != null) {
           const nv = ATTRS[a](v);
           if (nv !== v) _setAttr.call(el, a, nv);
         }
       }
       if (el instanceof HTMLLinkElement) {
-        const v = el.getAttribute('href');
+        const v = _getAttr.call(el, 'href');
         const nv = v != null && prox(v);
         if (nv && nv !== v) _setAttr.call(el, 'href', nv);
       }
       if (el.hasAttribute && el.hasAttribute('integrity')) el.removeAttribute('integrity');
     }
   }
-  new MutationObserver((records) => {
-    for (const r of records) for (const n of r.addedNodes) fixTree(n);
-  }).observe(document, { childList: true, subtree: true });
+  function fixStyleAttr(el) {
+    const v = _getAttr.call(el, 'style');
+    const nv = v && proxCss(v);
+    if (nv && nv !== v) _setAttr.call(el, 'style', nv);
+  }
+  const observer = new MutationObserver((records) => {
+    for (const r of records) {
+      // el.style.backgroundImage = ... only shows up as a style attribute change.
+      if (r.type === 'attributes') fixStyleAttr(r.target);
+      else for (const n of r.addedNodes) fixTree(n);
+    }
+  });
 
   // Route link clicks through the proxy if no router handled them.
   addEventListener('click', (e) => {
     if (e.defaultPrevented) return;
     const a = e.target && e.target.closest && e.target.closest('a[href], area[href]');
     if (!a || a.hasAttribute('download')) return;
-    const raw = a.getAttribute('href');
+    const raw = _getAttr.call(a, 'href');
     if (!raw || raw[0] === '#' || isProxied(raw)) return;
     let x;
     try { x = new URL(a.href); } catch (err) { return; } // the site's URL (see the href getter above)
     if (!/^https?:$/.test(x.protocol)) return;
     const here = new URL(upHere());
     if (x.hash && x.origin === here.origin && x.pathname === here.pathname && x.search === here.search) return;
+    const t = frameTarget(a.getAttribute('target') || baseTarget());
+    if (t != null) _setAttr.call(a, 'target', t);
     _setAttr.call(a, 'href', prox(x.href));
   });
 
@@ -1467,12 +2153,38 @@ function runtime(C, rewriteJs) {
   addEventListener('hashchange', report);
   addEventListener('DOMContentLoaded', report);
   addEventListener('load', report);
+
+  // Per document: a reused window gets a new one.
+  function perDoc() {
+    const ref = document.referrer;
+    hidden(document, '__px$L', L);
+    own(document, 'URL', upHere);
+    own(document, 'documentURI', upHere);
+    own(document, 'referrer', () => (ref.startsWith(ME + '/') ? unprox(ref) : ''));
+    try {
+      Object.defineProperty(document, 'domain', { get: () => UP.hostname, set: () => {}, configurable: true });
+    } catch (e) {}
+    observer.observe(document, { childList: true, subtree: true, attributes: true, attributeFilter: ['style'] });
+    // Outermost proxied frame: show the real path and remember the site.
+    if (!nested) {
+      if (location.href.startsWith(P)) {
+        const real = new URL(upHere());
+        if (real.origin === UP.origin) _replaceState.call(history, history.state, '', real.pathname + real.search + real.hash);
+      }
+      try {
+        cookieDesc.set.call(document, '__px_origin=' + encodeURIComponent(UP.origin) + cookieAttrs);
+      } catch (e) {}
+    }
+  }
+  perDoc();
 }
 
 function runtimeScript(upstream, prefix, swReload) {
-  const json = JSON.stringify({ upstream, prefix, swReload }).replace(/</g, '\\u003c');
+  const json = JSON.stringify({
+    upstream: upstream.href, prefix, swReload, cookieSite: cookieSite(upstream.hostname),
+  }).replace(/</g, '\\u003c');
   // __name: guard against bundlers that wrap functions with a name helper.
-  return `<script>(function(__name){(${runtime})(${json},${rewriteJs});})(function(f){return f;});</script>`;
+  return `<script data-px-rt>(function(__name){(${runtime})(${json},${rewriteJs},${mapSrcset},${rewriteCss},${workerRuntime});})(function(f){return f;});</script>`;
 }
 
 // ---------------------------------------------------------------- HTTP server
@@ -1506,7 +2218,7 @@ async function send(res, resp) {
   body.pipe(res);
 }
 
-const server = http.createServer(async (req, res) => {
+const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res) => {
   try {
     const request = toRequest(req, !['GET', 'HEAD'].includes(req.method));
     await send(res, await handle(request));
@@ -1518,6 +2230,19 @@ const server = http.createServer(async (req, res) => {
 
 // WebSockets: resolve the target like any request, then splice the raw
 // sockets together after sending the upgrade request upstream.
+const WS_TIMEOUT = 30_000;
+
+function upstreamSocket(target, port, secure, ca) {
+  return new Promise((resolve, reject) => {
+    const s = secure
+      ? tls.connect({ host: target.hostname, port, servername: target.hostname, ALPNProtocols: ['http/1.1'], lookup: safeLookup, ...(ca && { ca }) })
+      : net.connect({ host: target.hostname, port, lookup: safeLookup });
+    s.setTimeout(WS_TIMEOUT, () => s.destroy(Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' })));
+    s.once(secure ? 'secureConnect' : 'connect', () => { s.setTimeout(0); s.removeListener('error', reject); s.on('error', () => {}); resolve(s); });
+    s.once('error', reject);
+  });
+}
+
 server.on('upgrade', async (req, socket, head) => {
   socket.on('error', () => {});
   try {
@@ -1530,27 +2255,51 @@ server.on('upgrade', async (req, socket, head) => {
     const { self, target } = r;
     const secure = target.protocol === 'https:';
     const port = Number(target.port) || (secure ? 443 : 80);
-    const up = secure
-      ? tls.connect({ host: target.hostname, port, servername: target.hostname, ALPNProtocols: ['http/1.1'], lookup: safeLookup })
-      : net.connect({ host: target.hostname, port, lookup: safeLookup });
+    let closed = false;
+    socket.once('close', () => { closed = true; });
+    const key = `${target.hostname}:${port}`;
+    let ca = secure && hostAgents.has(key) ? (await chainAgent(target.hostname, port))?.options.ca : undefined;
+    let up;
+    try {
+      up = await upstreamSocket(target, port, secure, ca);
+    } catch (err) {
+      // Same incomplete-chain fallback as nodeFetch().
+      if (!secure || ca || !CHAIN_ERRORS.has(err.code)) throw err;
+      ca = (await chainAgent(target.hostname, port))?.options.ca;
+      if (!ca) throw err;
+      up = await upstreamSocket(target, port, secure, ca);
+    }
+    if (closed) { up.destroy(); return; }
 
     const lines = [`GET ${target.pathname}${target.search} HTTP/1.1`, `Host: ${target.host}`,
       'Connection: Upgrade', 'Upgrade: websocket'];
     for (const [k, v] of upstreamHeaders(request, self, target)) lines.push(`${k}: ${v}`);
 
-    up.once(secure ? 'secureConnect' : 'connect', () => {
-      up.write(lines.join('\r\n') + '\r\n\r\n');
-      if (head && head.length) up.write(head);
-      up.pipe(socket);
-      socket.pipe(up);
-    });
+    // Keep the timeout until the upstream answers the handshake.
+    up.setTimeout(WS_TIMEOUT, () => up.destroy());
+    up.once('data', () => up.setTimeout(0));
+    up.write(lines.join('\r\n') + '\r\n\r\n');
+    if (head && head.length) up.write(head);
+    up.pipe(socket);
+    socket.pipe(up);
     up.on('error', () => socket.destroy());
+    up.on('close', () => socket.destroy());
     socket.on('close', () => up.destroy());
   } catch {
-    socket.destroy();
+    // Upstream unreachable (or bad TLS): answer like the HTTP path does.
+    if (socket.writable) socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
+    else socket.destroy();
   }
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`Peekaboom listening on http://localhost:${PORT}`);
-});
+// Imported (e.g. by index.test.js) it only provides the exports below.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  server.listen(PORT, HOST, () => {
+    console.log(`Peekaboom listening on http://localhost:${PORT}`);
+  });
+}
+
+export {
+  server, rewriteHtml, rewriteCss, rewriteJs, mapSrcset, proxUrl, rewriteCookie, siteCookies, cookieSite,
+  decodeText, runtimeScript, withWorkerRuntime,
+};
