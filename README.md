@@ -5,3 +5,9 @@ Extremely compatible proxy that serves any public website so it can be embedded 
 ```
 git clone https://github.com/ltorl/Peekaboom-Proxy.git && cd peekaboom-proxy && node index.js && open http://localhost:8787 &
 ```
+
+
+#### Remotely (No Download)
+```
+curl -sL https://cdn.jsdelivr.net/gh/ltorl/Peekaboom-Proxy/index.js | node
+```
