@@ -11,3 +11,17 @@ git clone https://github.com/ltorl/Peekaboom-Proxy.git && cd peekaboom-proxy && 
 ```
 curl -sL https://cdn.jsdelivr.net/gh/ltorl/Peekaboom-Proxy/index.js | node
 ```
+
+
+
+Node js install shorcuts:
+
+windows:
+```
+winget install -e --id OpenJS.NodeJS
+```
+
+mac:
+```
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+```
